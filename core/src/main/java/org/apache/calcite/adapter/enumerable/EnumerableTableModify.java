@@ -32,7 +32,6 @@ import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.schema.ModifiableTable;
 import org.apache.calcite.util.BuiltInMethod;
 
-import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -97,49 +96,19 @@ public class EnumerableTableModify extends TableModify
             "count",
             Expressions.call(collectionParameter, "size"),
             false);
-    Expression convertedChildExp;
-    if (!getInput().getRowType().equals(getRowType())) {
-      final JavaTypeFactory typeFactory =
-          (JavaTypeFactory) getCluster().getTypeFactory();
-      final JavaRowFormat format = EnumerableTableScan.deduceFormat(table);
-      PhysType physType =
-          PhysTypeImpl.of(typeFactory, table.getRowType(), format);
-      List<Expression> expressionList = new ArrayList<>();
-      final PhysType childPhysType = result.physType;
-      final ParameterExpression o_ =
-          Expressions.parameter(childPhysType.getJavaRowType(), "o");
-      final int fieldCount =
-          childPhysType.getRowType().getFieldCount();
-      for (int i = 0; i < fieldCount; i++) {
-        expressionList.add(
-            childPhysType.fieldReference(o_, i, physType.getJavaFieldType(i)));
-      }
-      convertedChildExp =
-          builder.append(
-              "convertedChild",
-              Expressions.call(
-                  childExp,
-                  BuiltInMethod.SELECT.method,
-                  Expressions.lambda(
-                      physType.record(expressionList), o_)));
-    } else {
-      convertedChildExp = childExp;
-    }
-    final Method method;
     switch (getOperation()) {
     case INSERT:
-      method = BuiltInMethod.INTO.method;
+      implementInsert(builder, result, childExp, collectionParameter);
       break;
     case DELETE:
-      method = BuiltInMethod.REMOVE_ALL.method;
+      implementDelete(builder, result, childExp, collectionParameter);
+      break;
+    case UPDATE:
+      implementUpdate(builder, result, childExp, collectionParameter);
       break;
     default:
       throw new AssertionError(getOperation());
     }
-    builder.add(
-        Expressions.statement(
-            Expressions.call(
-                convertedChildExp, method, collectionParameter)));
     final Expression updatedCountParameter =
         builder.append(
             "updatedCount",
@@ -168,6 +137,102 @@ public class EnumerableTableModify extends TableModify
     return implementor.result(physType, builder.toBlock());
   }
 
+  private void implementInsert(BlockBuilder builder, Result result, Expression childExp,
+       ParameterExpression collectionParameter) {
+    Expression convertedChildExp = convertRowType(builder, result, childExp);
+    builder.add(
+        Expressions.statement(
+            Expressions.call(
+                convertedChildExp, BuiltInMethod.INTO.method, collectionParameter)));
+  }
+
+  private void implementDelete(BlockBuilder builder, Result result, Expression childExp,
+      ParameterExpression collectionParameter) {
+    Expression convertedChildExp = convertRowType(builder, result, childExp);
+    builder.add(
+        Expressions.statement(
+            Expressions.call(
+                convertedChildExp, BuiltInMethod.REMOVE_ALL.method, collectionParameter)));
+  }
+
+  private void implementUpdate(BlockBuilder builder, Result result, Expression childExp,
+      ParameterExpression collectionParameter) {
+    final PhysType childPhysType = result.physType;
+    final List<Expression> addExpressionList = new ArrayList<>();
+    final List<Expression> removeExpressionList = new ArrayList<>();
+    final ParameterExpression o_ =
+        Expressions.parameter(childPhysType.getJavaRowType(), "o");
+    final JavaTypeFactory typeFactory =
+        (JavaTypeFactory) getCluster().getTypeFactory();
+    final JavaRowFormat format = EnumerableTableScan.deduceFormat(table);
+    final PhysType physType =
+        PhysTypeImpl.of(typeFactory, table.getRowType(), format);
+    final int fieldCount =
+        physType.getRowType().getFieldCount();
+    final List<String> fieldNames = table.getRowType().getFieldNames();
+    final List<String> updateList = getUpdateColumnList();
+    for (int i = 0; i < fieldCount; i++) {
+      final String name = fieldNames.get(i);
+      final int updateIndex = updateList.indexOf(name);
+      final int refIndex = updateIndex == -1 ? i : fieldCount + updateIndex;
+      addExpressionList.add(
+          childPhysType.fieldReference(o_, refIndex, physType.getJavaFieldType(i)));
+      removeExpressionList.add(
+          childPhysType.fieldReference(o_, i, physType.getJavaFieldType(i)));
+    }
+    final BlockBuilder lambdaBuilder = new BlockBuilder();
+    lambdaBuilder.add(
+        Expressions.statement(
+            Expressions.call(
+                collectionParameter,
+                BuiltInMethod.COLLECTION_REMOVE.method,
+                physType.record(removeExpressionList))));
+    lambdaBuilder.add(
+        Expressions.statement(
+            Expressions.call(
+                collectionParameter,
+                BuiltInMethod.COLLECTION_ADD.method,
+                physType.record(addExpressionList))));
+    lambdaBuilder.append(
+        Expressions.constant(null));
+    builder.append(
+        Expressions.call(
+            childExp,
+            BuiltInMethod.ENUMERABLE_FOREACH.method,
+            Expressions.lambda(lambdaBuilder.toBlock(), o_)));
+  }
+
+  private Expression convertRowType(BlockBuilder builder, Result result, Expression childExp) {
+    Expression convertedChildExp;
+    if (!getInput().getRowType().equals(getRowType())) {
+      final JavaTypeFactory typeFactory =
+          (JavaTypeFactory) getCluster().getTypeFactory();
+      final JavaRowFormat format = EnumerableTableScan.deduceFormat(table);
+      PhysType physType =
+          PhysTypeImpl.of(typeFactory, table.getRowType(), format);
+      List<Expression> expressionList = new ArrayList<>();
+      final PhysType childPhysType = result.physType;
+      final ParameterExpression o_ =
+          Expressions.parameter(childPhysType.getJavaRowType(), "o");
+      final int fieldCount =
+          childPhysType.getRowType().getFieldCount();
+      for (int i = 0; i < fieldCount; i++) {
+        expressionList.add(
+            childPhysType.fieldReference(o_, i, physType.getJavaFieldType(i)));
+      }
+      convertedChildExp =
+          builder.append(
+              "convertedChild",
+              Expressions.call(
+                  childExp,
+                  BuiltInMethod.SELECT.method,
+                  Expressions.lambda(
+                      physType.record(expressionList), o_)));
+    } else {
+      convertedChildExp = childExp;
+    }
+    return convertedChildExp;
+  }
 }
 
 // End EnumerableTableModify.java
