@@ -36,9 +36,12 @@ import org.apache.calcite.linq4j.Queryable;
 import org.apache.calcite.linq4j.function.Function1;
 import org.apache.calcite.linq4j.function.Functions;
 import org.apache.calcite.linq4j.function.Predicate1;
+import org.apache.calcite.rel.RelCollation;
+import org.apache.calcite.rel.RelFieldCollation;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
 import org.apache.calcite.rel.type.RelDataTypeFactoryImpl;
+import org.apache.calcite.rel.type.RelDataTypeField;
 import org.apache.calcite.rel.type.RelDataTypeSystem;
 import org.apache.calcite.runtime.FlatLists;
 import org.apache.calcite.runtime.Hook;
@@ -81,6 +84,37 @@ import java.util.regex.Pattern;
 public class CalciteMetaImpl extends MetaImpl {
   static final Driver DRIVER = new Driver();
 
+  /** Metadata describing a primary key column. */
+  public static class MetaPkColumn implements Named {
+    public final String tableCat;
+    public final String tableSchem;
+    @ColumnNoNulls
+    public final String tableName;
+    @ColumnNoNulls
+    public final String columnName;
+    public final int keySeq;
+    public final String pkName;
+
+    public MetaPkColumn(
+            String tableCat,
+            String tableSchem,
+            String tableName,
+            String columnName,
+            int keySeq,
+            String pkName) {
+      this.tableCat = tableCat;
+      this.tableSchem = tableSchem;
+      this.tableName = tableName;
+      this.columnName = columnName;
+      this.keySeq = keySeq;
+      this.pkName = pkName;
+    }
+
+    public String getName() {
+      return columnName;
+    }
+  }
+
   public CalciteMetaImpl(CalciteConnectionImpl connection) {
     super(connection);
     this.connProps
@@ -98,12 +132,32 @@ public class CalciteMetaImpl extends MetaImpl {
     return v1 -> regex.matcher(v1.getName()).matches();
   }
 
+  static <T extends Named> Predicate1<T> namedMatcher(final String value) {
+    if (value == null) {
+      return Functions.truePredicate1();
+    }
+    if (value.isEmpty()) {
+      return v1 -> v1.getName() == null;
+    }
+    return v1 -> Objects.equals(v1.getName(), value);
+  }
+
   static Predicate1<String> matcher(final Pat pattern) {
     if (pattern.s == null || pattern.s.equals("%")) {
       return Functions.truePredicate1();
     }
     final Pattern regex = likeToRegex(pattern);
     return v1 -> regex.matcher(v1).matches();
+  }
+
+  static Predicate1<String> matcher(final String value) {
+    if (value == null) {
+      return Functions.truePredicate1();
+    }
+    if (value.isEmpty()) {
+      return Objects::isNull;
+    }
+    return v1 -> Objects.equals(v1, value);
   }
 
   /** Converts a LIKE-style pattern (where '%' represents a wild-card, escaped
@@ -341,6 +395,27 @@ public class CalciteMetaImpl extends MetaImpl {
         "IS_GENERATEDCOLUMN");
   }
 
+  @Override public MetaResultSet getPrimaryKeys(
+      ConnectionHandle ch,
+      String catalog,
+      String schema,
+      String table
+  ) {
+    final Predicate1<String> tableNameMatcher = matcher(table);
+    final Predicate1<MetaSchema> schemaMatcher = namedMatcher(schema);
+    return createResultSet(schemas(catalog)
+            .where(schemaMatcher)
+            .selectMany(s -> tables(s, tableNameMatcher))
+            .selectMany(this::primaryKeys),
+        MetaPkColumn.class,
+        "TABLE_CAT",
+        "TABLE_SCHEM",
+        "TABLE_NAME",
+        "COLUMN_NAME",
+        "KEY_SEQ",
+        "PK_NAME");
+  }
+
   Enumerable<MetaCatalog> catalogs() {
     final String catalog;
     try {
@@ -469,6 +544,31 @@ public class CalciteMetaImpl extends MetaImpl {
               field.getIndex() + 1,
               field.getType().isNullable() ? "YES" : "NO");
         });
+  }
+
+  public Enumerable<MetaPkColumn> primaryKeys(final MetaTable table_) {
+    final CalciteMetaTable table = (CalciteMetaTable) table_;
+    final List<RelDataTypeField> rowFields =
+        table.calciteTable.getRowType(getConnection().typeFactory).getFieldList();
+    // hack: get primary keys by collations, if there is one
+    final List<RelCollation> collations = table.calciteTable.getStatistic().getCollations();
+    if (collations.isEmpty()) {
+      return Linq4j.emptyEnumerable();
+    }
+    final List<RelFieldCollation> collationFields = collations.get(0).getFieldCollations();
+    final List<MetaPkColumn> result = new ArrayList<>(collationFields.size());
+    for (int i = 0; i < collationFields.size(); ++i) {
+      final RelDataTypeField field = rowFields.get(i);
+      final MetaPkColumn column = new MetaPkColumn(
+          table.tableCat,
+          table.tableSchem,
+          table.tableName,
+          field.getName(),
+          i,
+          null);
+      result.add(column);
+    }
+    return Linq4j.asEnumerable(result);
   }
 
   public MetaResultSet getSchemas(ConnectionHandle ch, String catalog, Pat schemaPattern) {
